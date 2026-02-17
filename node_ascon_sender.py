@@ -5,15 +5,15 @@ Node code:
 - Measures 5 metrics: Length, Criticality, Threat Level, CPU, RAM
 - Converts each metric to a 1..4 star score (4 = best / least demanding / least threat where applicable)
 - Sums stars (max 20), converts to percentage = (sum_stars * 5)
-- Chooses security profile based on percentage bands:
-    Profile 1: 0  <= X < 25
-    Profile 2: 25 <= X < 50
-    Profile 3: 50 <= X < 75
-    Profile 4: 75 <= X <= 100
+- Chooses security profile based on Algorithm.docx decimal-score bands (X = percent_score / 100.0):
+    Profile 1: 0.25   <= X < 0.4375
+    Profile 2: 0.4375 <= X < 0.625
+    Profile 3: 0.625  <= X < 0.8125
+    Profile 4: 0.8125 <= X <= 1.0
 - Encrypts with Ascon using selected profile
 - Sends to gateway over UDP (JSON packet)
 
-Implements the metric rules exactly as in Metrics.docx. :contentReference[oaicite:2]{index=2}
+Implements the metric rules exactly as in your docx.
 """
 
 from __future__ import annotations
@@ -75,8 +75,7 @@ SECURITY_PROFILES: dict[ProfileId, SecurityProfile] = {
     4: SecurityProfile("Critical / Long-Term", "Ascon-80pq", 16),
 }
 
-# -------------------- Metrics (as in docx) --------------------
-# Implements: Length, Criticality, Threat, CPU, RAM scoring exactly. :contentReference[oaicite:3]{index=3}
+# -------------------- Metrics --------------------
 
 LengthBand = Literal["Short", "Normal", "Long", "Very Long"]
 CriticalityLevel = Literal["Low", "Moderate", "High", "Critical"]
@@ -132,8 +131,7 @@ def _score_utilization(percent: float) -> int:
     # Low util (0<=x<25) ->4
     # Moderate (25<=x<50)->3
     # High (50<=x<75)->2
-    # Very high (75<=x<100)->1
-    # If percent == 100, treat as worst
+    # Very high (75<=x<=100)->1
     if 0 <= percent < 25:
         return 4
     if 25 <= percent < 50:
@@ -157,23 +155,34 @@ def measure_cpu_ram() -> tuple[float, float]:
         ram = max(0.0, min(100.0, ram))
         return cpu, ram
     except Exception:
-        # Fallback: not perfect, but deterministic enough for running without extra deps.
-        # CPU: random-ish low-to-mid; RAM: derived from env (still approximate).
         cpu = random.uniform(0, 60)
         ram = random.uniform(10, 70)
         return cpu, ram
 
 
+# -------------------- FIXED: profile thresholds to match Algorithm.docx --------------------
 def choose_security_profile(percent_score: int) -> ProfileId:
     """
-    Profile assignment based on the percentage bands in Metrics.docx. :contentReference[oaicite:4]{index=4}
-    Note: percent_score is 0..100.
+    Profile assignment based on Algorithm.docx decimal-score thresholds.
+
+    Let X = percent_score / 100.0, then:
+      - P1: 0.25   <= X < 0.4375
+      - P2: 0.4375 <= X < 0.625
+      - P3: 0.625  <= X < 0.8125
+      - P4: 0.8125 <= X <= 1.0
+
+    In your system (5 metrics, each 1..4 stars), percent_score is typically 25..100.
     """
-    if 0 <= percent_score < 25:
+    # clamp to [0, 100] just in case
+    percent_score = max(0, min(100, int(percent_score)))
+    x = percent_score / 100.0
+
+    # Map bands (lower bound inclusive, upper bound exclusive except last)
+    if x < 0.4375:
         return 1
-    if 25 <= percent_score < 50:
+    if x < 0.625:
         return 2
-    if 50 <= percent_score < 75:
+    if x < 0.8125:
         return 3
     return 4
 
@@ -519,7 +528,6 @@ def derive_node_master_key(node_id: str) -> bytes:
     Simple deterministic pre-shared master key (20 bytes) for research simulation.
     DO NOT use this as a real KDF. For a research prototype, it keeps node/gateway consistent.
     """
-    # 20 bytes from a stable hash-like construction (not cryptographic hashing on purpose to avoid extra deps)
     seed = (node_id + "|research-master-key").encode("utf-8")
     raw = bytearray(20)
     acc = 0
@@ -563,7 +571,7 @@ def build_packet(
         tag_len=sp.tag_len,
     )
 
-    # Gateway priority hint uses ONLY Length + Criticality (max 8) as you specified. :contentReference[oaicite:5]{index=5}
+    # Gateway priority hint uses ONLY Length + Criticality (max 8) as you specified.
     pri_raw = metrics.length_stars + metrics.criticality_stars
     pri_norm = pri_raw / 8.0
 
