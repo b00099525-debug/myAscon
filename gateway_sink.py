@@ -2,13 +2,13 @@
 """
 Gateway/Sink code:
 - Receives UDP packets from nodes
-- Computes priority ONLY from (Length stars + Criticality stars) / 8, as specified. :contentReference[oaicite:6]{index=6}
+- Computes priority ONLY from (Length stars + Criticality stars) / 8, as specified.
 - Runs two-stage scheduling:
     Stage A: time scheduling (process as received or time-sliced) for a configured duration
     Stage B: priority scheduling (highest normalized priority first; ties broken by oldest arrival)
 - Optionally decrypts payload for validation using pre-shared keys (same deterministic model as node)
 
-This is a research prototype scheduler/sink for your two-node setup. :contentReference[oaicite:7]{index=7}
+This is a research prototype scheduler/sink for your two-node setup.
 """
 
 from __future__ import annotations
@@ -238,7 +238,6 @@ class InboundItem:
     priority_norm: float
     pkt: dict[str, Any]
 
-# For heap: highest priority first => use negative
 def heap_key(item: InboundItem) -> tuple[float, float]:
     return (-item.priority_norm, item.arrival_ts)
 
@@ -246,7 +245,7 @@ def heap_key(item: InboundItem) -> tuple[float, float]:
 
 def compute_priority_from_packet(pkt: dict[str, Any]) -> float:
     """
-    Priority uses ONLY Criticality + Length stars, normalized by 8. :contentReference[oaicite:8]{index=8}
+    Priority uses ONLY Criticality + Length stars, normalized by 8.
     """
     m = pkt.get("metrics", {})
     length_stars = int(m.get("length_stars", 0))
@@ -299,16 +298,12 @@ def main() -> None:
     start_ts = time.time()
     last_process = 0.0
 
-    # In stage A, we keep FIFO.
     fifo: list[InboundItem] = []
-
-    # In stage B, we keep a heap by priority (highest first).
     heap: list[tuple[tuple[float, float], InboundItem]] = []
 
     while True:
         now = time.time()
 
-        # -------- receive as much as possible (non-blocking-ish) --------
         try:
             data, addr = sock.recvfrom(65535)
             pkt = json.loads(data.decode("utf-8"))
@@ -346,7 +341,6 @@ def main() -> None:
         except Exception as e:
             print(f"[gateway] receive/parse error: {e}")
 
-        # -------- process according to active scheduling stage --------
         if now - last_process >= max(0.05, args.process_interval):
             last_process = now
             stage_a = (now - start_ts) < args.time_scheduler_seconds
@@ -377,9 +371,6 @@ def main() -> None:
                     else:
                         out += f" | decrypt=OK plaintext_len={len(pt)}"
                 print(out)
-
-        # Ctrl+C to stop
-        # (no background behavior)
 
 if __name__ == "__main__":
     main()
