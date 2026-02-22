@@ -6,6 +6,8 @@ Gateway/Sink code:
 - Runs two-stage scheduling:
     Stage A: time scheduling (process as received or time-sliced) for a configured duration
     Stage B: priority scheduling (highest normalized priority first; ties broken by oldest arrival)
+    Aging mechanism applied to Stage B to prevent starvation.
+- Calculates and logs throughput and end-to-end delay per packet.
 - Optionally decrypts payload for validation using pre-shared keys (same deterministic model as node)
 
 This is a research prototype scheduler/sink for your two-node setup.
@@ -253,6 +255,20 @@ def compute_priority_from_packet(pkt: dict[str, Any]) -> float:
     raw = length_stars + criticality_stars
     return max(0.0, min(1.0, raw / 8.0))
 
+def apply_aging(heap: list, current_ts: float, aging_rate: float = 0.05) -> list:
+    """
+    Increases priority score over time to stop starvation.
+    aging_rate decides how fast priority scales per second waiting.
+    """
+    new_heap = []
+    for neg_prio, arr_ts, item in heap:
+        wait_time = current_ts - arr_ts
+        aged_prio = min(1.0, item.priority_norm + (wait_time * aging_rate))
+        new_heap.append((-aged_prio, arr_ts, item))
+    heapq.heapify(new_heap)
+    return new_heap
+
+
 def try_decrypt(pkt: dict[str, Any]) -> bytes | None:
     sec = pkt.get("security", {})
     variant = sec.get("variant", "Ascon-128")
@@ -292,20 +308,32 @@ def main() -> None:
     sock.settimeout(0.2)
 
     print(f"[gateway] listening on {args.bind_host}:{args.bind_port}")
-    print(f"[gateway] stage A (time scheduling) for {args.time_scheduler_seconds}s, then stage B (priority scheduling)")
+    print(f"[gateway] stage A (FIFO) for {args.time_scheduler_seconds}s, then stage B (Priority with Aging)")
     print(f"[gateway] process_interval={args.process_interval}s decrypt={args.decrypt}")
 
     start_ts = time.time()
-    last_process = 0.0
-
+    
     fifo: list[InboundItem] = []
-    heap: list[tuple[tuple[float, float], InboundItem]] = []
+    heap: list[tuple[float, float, InboundItem]] = []
+    stage_a_ended = False
+    
+    total_bytes_received = 0
 
     while True:
         now = time.time()
+        stage_a_active = (now - start_ts) < args.time_scheduler_seconds
+
+        # --- Transition Hook: Moving Stage A packets to Stage B ---
+        if not stage_a_active and not stage_a_ended:
+            print("\n[gateway] TIME EXPIRED. Switching to Priority Scheduling (Stage B). Moving remaining Stage A packets...")
+            while fifo:
+                old_item = fifo.pop(0)
+                heapq.heappush(heap, (-old_item.priority_norm, old_item.arrival_ts, old_item))
+            stage_a_ended = True
 
         try:
             data, addr = sock.recvfrom(65535)
+            total_bytes_received += len(data)
             pkt = json.loads(data.decode("utf-8"))
 
             if pkt.get("type") != "ascon_node_msg":
@@ -323,54 +351,46 @@ def main() -> None:
                 pkt=pkt,
             )
 
-            stage_a = (now - start_ts) < args.time_scheduler_seconds
-            if stage_a:
+            if stage_a_active:
                 fifo.append(item)
+                print(f"-> [Stage A In] Node: {item.node_id} Seq: {item.seq}")
             else:
-                heapq.heappush(heap, (heap_key(item), item))
-
-            m = pkt.get("metrics", {})
-            print(
-                f"[recv] from={addr[0]}:{addr[1]} node={node_id} seq={seq} "
-                f"len={m.get('length_bytes')} crit={m.get('criticality')} "
-                f"priority={(pr):.3f} stage={'A' if stage_a else 'B'}"
-            )
+                heapq.heappush(heap, (-item.priority_norm, item.arrival_ts, item))
+                print(f"-> [Stage B In] Node: {item.node_id} Seq: {item.seq} Base Prio: {item.priority_norm:.3f}")
 
         except socket.timeout:
-            pass
-        except Exception as e:
-            print(f"[gateway] receive/parse error: {e}")
+            pass 
 
-        if now - last_process >= max(0.05, args.process_interval):
-            last_process = now
-            stage_a = (now - start_ts) < args.time_scheduler_seconds
-
-            item: InboundItem | None = None
-            if stage_a:
-                if fifo:
-                    item = fifo.pop(0)
-            else:
-                if heap:
-                    _, item = heapq.heappop(heap)
-
-            if item is not None:
-                pkt = item.pkt
-                sec = pkt.get("security", {})
-                m = pkt.get("metrics", {})
-                out = (
-                    f"[process {'A' if stage_a else 'B'}] node={item.node_id} seq={item.seq} "
-                    f"priority={item.priority_norm:.3f} "
-                    f"profile={sec.get('profile_id')}({sec.get('variant')},tag={sec.get('tag_len')}) "
-                    f"stars={m.get('sum_stars')}/20 score={m.get('percent_score')}%"
-                )
-
+        # --- Processing Logic ---
+        if stage_a_active:
+            if fifo:
+                processed_item = fifo.pop(0)
+                
+                # Metric calculations (End-to-End Delay & Throughput)
+                delay = time.time() - processed_item.pkt["ts"]
+                throughput = total_bytes_received / max(1.0, time.time() - start_ts)
+                
+                print(f"<- [Stage A Out] Node: {processed_item.node_id} Seq: {processed_item.seq} | Delay: {delay*1000:.2f}ms | Throughput: {throughput/1024:.2f} KB/s")
                 if args.decrypt:
-                    pt = try_decrypt(pkt)
-                    if pt is None:
-                        out += " | decrypt=FAIL"
-                    else:
-                        out += f" | decrypt=OK plaintext_len={len(pt)}"
-                print(out)
+                    decrypted = try_decrypt(processed_item.pkt)
+                    print(f"   Decrypted: {decrypted is not None}")
+
+        else:
+            if heap:
+                # Apply Aging
+                heap = apply_aging(heap, now, aging_rate=0.05)
+                _, arr_ts, processed_item = heapq.heappop(heap)
+                
+                # Metric calculations (End-to-End Delay & Throughput)
+                delay = time.time() - processed_item.pkt["ts"]
+                throughput = total_bytes_received / max(1.0, time.time() - start_ts)
+
+                print(f"<- [Stage B Out] Node: {processed_item.node_id} Seq: {processed_item.seq} | Delay: {delay*1000:.2f}ms | Throughput: {throughput/1024:.2f} KB/s")
+                if args.decrypt:
+                    decrypted = try_decrypt(processed_item.pkt)
+                    print(f"   Decrypted: {decrypted is not None}")
+        
+        time.sleep(0.01)
 
 if __name__ == "__main__":
     main()
