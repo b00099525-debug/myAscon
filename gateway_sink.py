@@ -2,7 +2,7 @@
 """
 Gateway/Sink code:
 - Receives UDP packets from nodes
-- Computes priority ONLY from (Length stars + Criticality stars) / 8, as specified.
+- Computes priority ONLY from (Length stars + Criticality stars) / 8
 - Runs two-stage scheduling:
     Stage A: time scheduling (process as received or time-sliced) for a configured duration
     Stage B: priority scheduling (highest normalized priority first; ties broken by oldest arrival)
