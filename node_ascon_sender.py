@@ -14,7 +14,6 @@ Node code:
 - Uses pyjoules to measure current energy consumption
 - Sends to gateway over UDP (JSON packet)
 
-Implements the metric rules exactly as in your docx.
 """
 
 from __future__ import annotations
