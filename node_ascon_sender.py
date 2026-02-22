@@ -11,6 +11,7 @@ Node code:
     Profile 3: 0.625  <= X < 0.8125
     Profile 4: 0.8125 <= X <= 1.0
 - Encrypts with Ascon using selected profile
+- Uses pyjoules to measure current energy consumption
 - Sends to gateway over UDP (JSON packet)
 
 Implements the metric rules exactly as in your docx.
@@ -26,6 +27,14 @@ import socket
 import time
 from dataclasses import dataclass
 from typing import Literal, TypeAlias, Iterable
+
+try:
+    from pyJoules.energy_meter import measure_energy
+    from pyJoules.handler.print_handler import PrintHandler
+    PYJOULES_AVAILABLE = True
+except ImportError:
+    PYJOULES_AVAILABLE = False
+    print("Warning: pyJoules not installed. Energy measurement will be skipped. Run 'pip install pyjoules'")
 
 # -------------------- Types --------------------
 
@@ -105,15 +114,12 @@ class MetricScores:
 
 
 def _score_length(n: int) -> tuple[LengthBand, int]:
-    # Short: 0–64 -> 4
-    # Normal: 65–256 -> 3
-    # Long: 257–1024 -> 2
-    # Very Long: >1024 -> 1
+    # Fixed to match Algorithm.docx boundaries without a gap
     if 0 <= n <= 64:
         return ("Short", 4)
-    if 65 <= n <= 256:
+    if 65 <= n <= 254:
         return ("Normal", 3)
-    if 257 <= n <= 1024:
+    if 255 <= n <= 1024:
         return ("Long", 2)
     return ("Very Long", 1)
 
@@ -122,9 +128,27 @@ def _score_criticality(level: CriticalityLevel) -> int:
     return {"Low": 1, "Moderate": 2, "High": 3, "Critical": 4}[level]
 
 
-def _score_threat(level: ThreatLevel) -> int:
-    # Zero threat 4, Low 3, Moderate 2, High 1
-    return {"Zero": 4, "Low": 3, "Moderate": 2, "High": 1}[level]
+def measure_threat_level() -> tuple[ThreatLevel, int]:
+    """
+    Actually measures the threat level by evaluating network state.
+    """
+    try:
+        import psutil
+        conns = psutil.net_connections(kind='inet')
+        suspicious_states = ('SYN_RECV', 'TIME_WAIT', 'CLOSE_WAIT')
+        suspicious_count = sum(1 for c in conns if c.status in suspicious_states)
+        total_count = len(conns)
+
+        if suspicious_count > 30 or total_count > 150:
+            return ("High", 1)
+        elif suspicious_count > 15 or total_count > 75:
+            return ("Moderate", 2)
+        elif suspicious_count > 5 or total_count > 30:
+            return ("Low", 3)
+        else:
+            return ("Zero", 4)
+    except Exception:
+        return ("Zero", 4)
 
 
 def _score_utilization(percent: float) -> int:
@@ -160,24 +184,15 @@ def measure_cpu_ram() -> tuple[float, float]:
         return cpu, ram
 
 
-# -------------------- FIXED: profile thresholds to match Algorithm.docx --------------------
 def choose_security_profile(percent_score: int) -> ProfileId:
     """
     Profile assignment based on Algorithm.docx decimal-score thresholds.
-
-    Let X = percent_score / 100.0, then:
-      - P1: 0.25   <= X < 0.4375
-      - P2: 0.4375 <= X < 0.625
-      - P3: 0.625  <= X < 0.8125
-      - P4: 0.8125 <= X <= 1.0
-
-    In your system (5 metrics, each 1..4 stars), percent_score is typically 25..100.
     """
     # clamp to [0, 100] just in case
     percent_score = max(0, min(100, int(percent_score)))
     x = percent_score / 100.0
 
-    # Map bands (lower bound inclusive, upper bound exclusive except last)
+    # Map bands
     if x < 0.4375:
         return 1
     if x < 0.625:
@@ -193,8 +208,7 @@ def compute_metrics(payload_len: int) -> MetricScores:
     criticality: CriticalityLevel = random.choice(["Low", "Moderate", "High", "Critical"])
     criticality_stars = _score_criticality(criticality)
 
-    threat: ThreatLevel = random.choice(["Zero", "Low", "Moderate", "High"])
-    threat_stars = _score_threat(threat)
+    threat, threat_stars = measure_threat_level()
 
     cpu_percent, ram_percent = measure_cpu_ram()
     cpu_stars = _score_utilization(cpu_percent)
@@ -202,7 +216,7 @@ def compute_metrics(payload_len: int) -> MetricScores:
 
     sum_stars = length_stars + criticality_stars + threat_stars + cpu_stars + ram_stars
 
-    # As described: multiply by 5 to map max 20 -> 100
+    # Multiply by 5 to map max 20 -> 100
     percent_score = int(sum_stars * 5)
     percent_score = max(0, min(100, percent_score))
     decimal_score = percent_score / 100.0
@@ -492,6 +506,7 @@ def printwords(S: list[int], description: str = "") -> None:
     print(" " + description)
     print("\n".join(["  x{i}={s:016x}".format(**locals()) for i, s in enumerate(S)]))
 
+
 # -------------------- Traffic generation --------------------
 
 def generate_payload(length_mode: str) -> bytes:
@@ -509,9 +524,9 @@ def generate_payload(length_mode: str) -> bytes:
     if mode == "short":
         n = random.randint(0, 64)
     elif mode == "normal":
-        n = random.randint(65, 256)
+        n = random.randint(65, 254)
     elif mode == "long":
-        n = random.randint(257, 1024)
+        n = random.randint(255, 1024)
     elif mode in ("verylong", "very_long", "very-long"):
         n = random.randint(1025, 2048)
     else:
@@ -520,6 +535,7 @@ def generate_payload(length_mode: str) -> bytes:
         return generate_payload(choice)
 
     return get_random_bytes(n)
+
 
 # -------------------- Keying model (pre-shared) --------------------
 
@@ -545,14 +561,10 @@ def profile_key_from_master(master20: bytes, profile: ProfileId) -> bytes:
         return master20
     return master20[:16]
 
+
 # -------------------- Packet send --------------------
 
-def build_packet(
-    node_id: str,
-    seq: int,
-    associated_data: bytes,
-    payload: bytes,
-) -> dict:
+def build_packet(node_id: str, seq: int, associated_data: bytes, payload: bytes) -> dict:
     metrics = compute_metrics(len(payload))
     profile = choose_security_profile(metrics.percent_score)
     sp = SECURITY_PROFILES[profile]
@@ -638,10 +650,22 @@ def main() -> None:
     sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
 
     associated_data = args.ad.encode("utf-8")
+    
+    # Initialize pyjoules handler
+    energy_handler = PrintHandler() if PYJOULES_AVAILABLE else None
 
     for seq in range(1, args.count + 1):
         payload = generate_payload(args.length_mode)
-        pkt = build_packet(args.node_id, seq, associated_data, payload)
+        
+        # Measure energy strictly for packet building and encryption
+        if PYJOULES_AVAILABLE:
+            @measure_energy(handler=energy_handler)
+            def profiled_build():
+                return build_packet(args.node_id, seq, associated_data, payload)
+            pkt = profiled_build()
+        else:
+            pkt = build_packet(args.node_id, seq, associated_data, payload)
+
         raw = json.dumps(pkt).encode("utf-8")
         sock.sendto(raw, addr)
 
