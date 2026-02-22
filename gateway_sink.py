@@ -10,7 +10,7 @@ Gateway/Sink code:
 - Calculates and logs throughput and end-to-end delay per packet.
 - Optionally decrypts payload for validation using pre-shared keys (same deterministic model as node)
 
-This is a research prototype scheduler/sink for your two-node setup.
+This is a research prototype scheduler/sink for our two-node setup.
 """
 
 from __future__ import annotations
