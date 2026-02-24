@@ -3,17 +3,12 @@
 Node code:
 - Generates traffic of varying lengths
 - Measures 5 metrics: Length, Criticality, Threat Level, CPU, RAM
-- Converts each metric to a 1..4 star score (4 = best / least demanding / least threat where applicable)
-- Sums stars (max 20), converts to percentage = (sum_stars * 5)
-- Chooses security profile based on Algorithm.docx decimal-score bands (X = percent_score / 100.0):
-    Profile 1: 0.25   <= X < 0.4375
-    Profile 2: 0.4375 <= X < 0.625
-    Profile 3: 0.625  <= X < 0.8125
-    Profile 4: 0.8125 <= X <= 1.0
+- Converts each metric to a 1..4 star score
+- Sums stars (max 20), converts to percentage
+- Chooses security profile based on decimal-score bands
 - Encrypts with Ascon using selected profile
-- Uses pyjoules to measure current energy consumption
-- Sends to gateway over UDP (JSON packet)
-
+- Uses pyjoules to measure and print "Energy Consumed:"
+- Sends to gateway over UDP (JSON packet) with a timestamp for Delay calculation
 """
 
 from __future__ import annotations
@@ -28,8 +23,7 @@ from dataclasses import dataclass
 from typing import Literal, TypeAlias, Iterable
 
 try:
-    from pyJoules.energy_meter import measure_energy
-    from pyJoules.handler.print_handler import PrintHandler
+    from pyJoules.energy_meter import EnergyMeter
     PYJOULES_AVAILABLE = True
 except ImportError:
     PYJOULES_AVAILABLE = False
@@ -56,13 +50,13 @@ debugpermutation = False
 
 @dataclass(frozen=True)
 class AeadParams:
-    key_len: int      # bytes 16 for 128/128a and 20 for 80pq
-    nonce_len: int    # bytes 16
-    rate: int         # bytes 8 for 128/80pq and 16 for 128a
-    a: int            # pa rounds 12
-    b: int            # pb rounds 6 for 128/80pq and 8 for 128a
-    tag_len: int      # bytes 16 (we may truncate for profile 1)
-    iv: bytes         # IV bytes from Ascon spec (length = 24 - key_len)
+    key_len: int      
+    nonce_len: int    
+    rate: int         
+    a: int            
+    b: int            
+    tag_len: int      
+    iv: bytes         
 
 AEAD_PARAMS: dict[AsconAeadVariant, AeadParams] = {
     "Ascon-128":  AeadParams(16, 16, 8, 12, 6, 16, bytes.fromhex("80400c0600000000")),
@@ -74,7 +68,7 @@ AEAD_PARAMS: dict[AsconAeadVariant, AeadParams] = {
 class SecurityProfile:
     name: str
     variant: AsconAeadVariant
-    tag_len: int  # bytes
+    tag_len: int  
 
 SECURITY_PROFILES: dict[ProfileId, SecurityProfile] = {
     1: SecurityProfile("Lightweight (IoT)", "Ascon-128", 8),
@@ -108,18 +102,14 @@ class MetricScores:
     ram_stars: int
 
     sum_stars: int
-    percent_score: int         # 0..100 (we will end up in 25..100 given 5 metrics)
-    decimal_score: float       # percent_score / 100.0
+    percent_score: int         
+    decimal_score: float       
 
 
 def _score_length(n: int) -> tuple[LengthBand, int]:
-    # Fixed to match Algorithm.docx boundaries without a gap
-    if 0 <= n <= 64:
-        return ("Short", 4)
-    if 65 <= n <= 254:
-        return ("Normal", 3)
-    if 255 <= n <= 1024:
-        return ("Long", 2)
+    if 0 <= n <= 64: return ("Short", 4)
+    if 65 <= n <= 254: return ("Normal", 3)
+    if 255 <= n <= 1024: return ("Long", 2)
     return ("Very Long", 1)
 
 
@@ -128,9 +118,6 @@ def _score_criticality(level: CriticalityLevel) -> int:
 
 
 def measure_threat_level() -> tuple[ThreatLevel, int]:
-    """
-    Actually measures the threat level by evaluating network state.
-    """
     try:
         import psutil
         conns = psutil.net_connections(kind='inet')
@@ -138,66 +125,37 @@ def measure_threat_level() -> tuple[ThreatLevel, int]:
         suspicious_count = sum(1 for c in conns if c.status in suspicious_states)
         total_count = len(conns)
 
-        if suspicious_count > 30 or total_count > 150:
-            return ("High", 1)
-        elif suspicious_count > 15 or total_count > 75:
-            return ("Moderate", 2)
-        elif suspicious_count > 5 or total_count > 30:
-            return ("Low", 3)
-        else:
-            return ("Zero", 4)
+        if suspicious_count > 30 or total_count > 150: return ("High", 1)
+        elif suspicious_count > 15 or total_count > 75: return ("Moderate", 2)
+        elif suspicious_count > 5 or total_count > 30: return ("Low", 3)
+        else: return ("Zero", 4)
     except Exception:
         return ("Zero", 4)
 
 
 def _score_utilization(percent: float) -> int:
-    # Low util (0<=x<25) ->4
-    # Moderate (25<=x<50)->3
-    # High (50<=x<75)->2
-    # Very high (75<=x<=100)->1
-    if 0 <= percent < 25:
-        return 4
-    if 25 <= percent < 50:
-        return 3
-    if 50 <= percent < 75:
-        return 2
+    if 0 <= percent < 25: return 4
+    if 25 <= percent < 50: return 3
+    if 50 <= percent < 75: return 2
     return 1
 
 
 def measure_cpu_ram() -> tuple[float, float]:
-    """
-    CPU/RAM in general (not necessarily at the exact encryption moment).
-    Uses psutil if available, otherwise falls back to a safe approximation.
-    """
     try:
-        import psutil  # type: ignore
+        import psutil  
         cpu = float(psutil.cpu_percent(interval=0.2))
         ram = float(psutil.virtual_memory().percent)
-        # clamp
-        cpu = max(0.0, min(100.0, cpu))
-        ram = max(0.0, min(100.0, ram))
-        return cpu, ram
+        return max(0.0, min(100.0, cpu)), max(0.0, min(100.0, ram))
     except Exception:
-        cpu = random.uniform(0, 60)
-        ram = random.uniform(10, 70)
-        return cpu, ram
+        return random.uniform(0, 60), random.uniform(10, 70)
 
 
 def choose_security_profile(percent_score: int) -> ProfileId:
-    """
-    Profile assignment based on Algorithm.docx decimal-score thresholds.
-    """
-    # clamp to [0, 100] just in case
     percent_score = max(0, min(100, int(percent_score)))
     x = percent_score / 100.0
-
-    # Map bands
-    if x < 0.4375:
-        return 1
-    if x < 0.625:
-        return 2
-    if x < 0.8125:
-        return 3
+    if x < 0.4375: return 1
+    if x < 0.625: return 2
+    if x < 0.8125: return 3
     return 4
 
 
@@ -215,7 +173,6 @@ def compute_metrics(payload_len: int) -> MetricScores:
 
     sum_stars = length_stars + criticality_stars + threat_stars + cpu_stars + ram_stars
 
-    # Multiply by 5 to map max 20 -> 100
     percent_score = int(sum_stars * 5)
     percent_score = max(0, min(100, percent_score))
     decimal_score = percent_score / 100.0
@@ -238,7 +195,7 @@ def compute_metrics(payload_len: int) -> MetricScores:
     )
 
 
-# -------------------- Ascon Core (AEAD only, from your code) --------------------
+# -------------------- Ascon Core --------------------
 
 def ascon_encrypt(
     key: BytesLike,
@@ -300,10 +257,9 @@ def ascon_initialize(S: list[int], p: AeadParams, key: BytesLike, nonce: BytesLi
     iv_len = 24 - p.key_len
     assert len(p.iv) == iv_len, f"IV length mismatch: expected {iv_len}, got {len(p.iv)}"
 
-    init = p.iv + to_bytes(key) + to_bytes(nonce)  # 40 bytes
+    init = p.iv + to_bytes(key) + to_bytes(nonce)  
     S[0], S[1], S[2], S[3], S[4] = bytes_to_state(init)
-    if debug:
-        printstate(S, "initial value:")
+    if debug: printstate(S, "initial value:")
 
     ascon_permutation(S, p.a)
 
@@ -313,8 +269,7 @@ def ascon_initialize(S: list[int], p: AeadParams, key: BytesLike, nonce: BytesLi
         buf[off + i] ^= key[i]
     S[0], S[1], S[2], S[3], S[4] = bytes_to_state(bytes(buf))
 
-    if debug:
-        printstate(S, "initialization:")
+    if debug: printstate(S, "initialization:")
 
 
 def ascon_process_associated_data(S: list[int], b: int, rate: int, associateddata: BytesLike) -> None:
@@ -329,8 +284,7 @@ def ascon_process_associated_data(S: list[int], b: int, rate: int, associateddat
             ascon_permutation(S, b)
 
     S[4] ^= 1 << 63
-    if debug:
-        printstate(S, "process associated data:")
+    if debug: printstate(S, "process associated data:")
 
 
 def ascon_process_plaintext(S: list[int], b: int, rate: int, plaintext: BytesLike) -> bytes:
@@ -359,8 +313,7 @@ def ascon_process_plaintext(S: list[int], b: int, rate: int, plaintext: BytesLik
         out = int_to_bytes(S[0], 8)
 
     ciphertext += out[:p_lastlen]
-    if debug:
-        printstate(S, "process plaintext:")
+    if debug: printstate(S, "process plaintext:")
     return ciphertext
 
 
@@ -406,8 +359,7 @@ def ascon_process_ciphertext(S: list[int], b: int, rate: int, ciphertext: BytesL
 
         S[0] = (S[0] & bytes_to_int(c_mask[0:8])) ^ c0 ^ bytes_to_int(c_padx[0:8])
 
-    if debug:
-        printstate(S, "process ciphertext:")
+    if debug: printstate(S, "process ciphertext:")
     return plaintext
 
 
@@ -430,15 +382,13 @@ def ascon_finalize(S: list[int], p: AeadParams, key: BytesLike) -> bytes:
     S[0], S[1], S[2], S[3], S[4] = bytes_to_state(bytes(buf))
 
     tag = int_to_bytes(S[3], 8) + int_to_bytes(S[4], 8)
-    if debug:
-        printstate(S, "finalization:")
+    if debug: printstate(S, "finalization:")
     return tag
 
 
 def ascon_permutation(S: list[int], rounds: int = 1) -> None:
     assert rounds <= 12
-    if debugpermutation:
-        printwords(S, "permutation input:")
+    if debugpermutation: printwords(S, "permutation input:")
 
     for r in range(12 - rounds, 12):
         S[2] ^= (0xF0 - r * 0x10 + r * 0x1)
@@ -509,27 +459,16 @@ def printwords(S: list[int], description: str = "") -> None:
 # -------------------- Traffic generation --------------------
 
 def generate_payload(length_mode: str) -> bytes:
-    """
-    length_mode:
-      - fixed:<N>
-      - random (selects a length across bands)
-      - short | normal | long | verylong
-    """
     if length_mode.startswith("fixed:"):
         n = int(length_mode.split(":", 1)[1])
         return get_random_bytes(max(0, n))
 
     mode = length_mode.lower().strip()
-    if mode == "short":
-        n = random.randint(0, 64)
-    elif mode == "normal":
-        n = random.randint(65, 254)
-    elif mode == "long":
-        n = random.randint(255, 1024)
-    elif mode in ("verylong", "very_long", "very-long"):
-        n = random.randint(1025, 2048)
+    if mode == "short": n = random.randint(0, 64)
+    elif mode == "normal": n = random.randint(65, 254)
+    elif mode == "long": n = random.randint(255, 1024)
+    elif mode in ("verylong", "very_long", "very-long"): n = random.randint(1025, 2048)
     else:
-        # random across all bands with equal chance
         choice = random.choice(["short", "normal", "long", "verylong"])
         return generate_payload(choice)
 
@@ -539,10 +478,6 @@ def generate_payload(length_mode: str) -> bytes:
 # -------------------- Keying model (pre-shared) --------------------
 
 def derive_node_master_key(node_id: str) -> bytes:
-    """
-    Simple deterministic pre-shared master key (20 bytes) for research simulation.
-    DO NOT use this as a real KDF. For a research prototype, it keeps node/gateway consistent.
-    """
     seed = (node_id + "|research-master-key").encode("utf-8")
     raw = bytearray(20)
     acc = 0
@@ -552,10 +487,6 @@ def derive_node_master_key(node_id: str) -> bytes:
     return bytes(raw)
 
 def profile_key_from_master(master20: bytes, profile: ProfileId) -> bytes:
-    """
-    Profiles 1-3 use 16-byte keys, profile 4 uses 20-byte key.
-    We slice the same deterministic master so node and gateway match.
-    """
     if profile == 4:
         return master20
     return master20[:16]
@@ -582,7 +513,6 @@ def build_packet(node_id: str, seq: int, associated_data: bytes, payload: bytes)
         tag_len=sp.tag_len,
     )
 
-    # Gateway priority hint uses ONLY Length + Criticality (max 8) as you specified.
     pri_raw = metrics.length_stars + metrics.criticality_stars
     pri_norm = pri_raw / 8.0
 
@@ -596,19 +526,14 @@ def build_packet(node_id: str, seq: int, associated_data: bytes, payload: bytes)
             "length_bytes": metrics.length_bytes,
             "length_band": metrics.length_band,
             "length_stars": metrics.length_stars,
-
             "criticality": metrics.criticality,
             "criticality_stars": metrics.criticality_stars,
-
             "threat": metrics.threat,
             "threat_stars": metrics.threat_stars,
-
             "cpu_percent": round(metrics.cpu_percent, 2),
             "cpu_stars": metrics.cpu_stars,
-
             "ram_percent": round(metrics.ram_percent, 2),
             "ram_stars": metrics.ram_stars,
-
             "sum_stars": metrics.sum_stars,
             "percent_score": metrics.percent_score,
             "decimal_score": metrics.decimal_score,
@@ -649,34 +574,44 @@ def main() -> None:
     sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
 
     associated_data = args.ad.encode("utf-8")
-    
-    # Initialize pyjoules handler
-    energy_handler = PrintHandler() if PYJOULES_AVAILABLE else None
 
     for seq in range(1, args.count + 1):
         payload = generate_payload(args.length_mode)
-        
-        # Measure energy strictly for packet building and encryption
+        energy_consumed_str = ""
+
         if PYJOULES_AVAILABLE:
-            @measure_energy(handler=energy_handler)
-            def profiled_build():
-                return build_packet(args.node_id, seq, associated_data, payload)
-            pkt = profiled_build()
+            try:
+                meter = EnergyMeter()
+                meter.start()
+                pkt = build_packet(args.node_id, seq, associated_data, payload)
+                meter.stop()
+                trace = meter.get_trace()
+                
+                # Extract and sum up all energy domains measured by the hardware
+                total_uj = 0
+                for sample in trace:
+                    for domain, val in sample.energy.items():
+                        total_uj += val
+                energy_consumed_str = f"| Energy Consumed: {total_uj} uJ"
+            except Exception as e:
+                pkt = build_packet(args.node_id, seq, associated_data, payload)
+                energy_consumed_str = f"| Energy Consumed: [Measurement Error or Hardware unsupported]"
         else:
             pkt = build_packet(args.node_id, seq, associated_data, payload)
+            energy_consumed_str = f"| Energy Consumed: [pyJoules not installed]"
 
         raw = json.dumps(pkt).encode("utf-8")
         sock.sendto(raw, addr)
 
-        # Small console summary (kept readable for experiments)
         m = pkt["metrics"]
         s = pkt["security"]
         ph = pkt["priority_hint"]
+        
         print(
             f"[{args.node_id} seq={seq}] len={m['length_bytes']}({m['length_band']}) "
             f"crit={m['criticality']} thr={m['threat']} cpu={m['cpu_percent']}% ram={m['ram_percent']}% "
             f"stars={m['sum_stars']}/20 score={m['percent_score']}% -> profile={s['profile_id']}({s['variant']},tag={s['tag_len']}) "
-            f"priority_hint={ph['normalized']:.3f}"
+            f"priority_hint={ph['normalized']:.3f} {energy_consumed_str}"
         )
 
         time.sleep(max(0.0, args.interval))
